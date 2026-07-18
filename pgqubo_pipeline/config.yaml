@@ -1,0 +1,64 @@
+# =============================================================================
+# Config for the pangenome-guided sequence assembly pipeline
+# (Cudby et al., Briefings in Bioinformatics 2026, bbag084)
+# =============================================================================
+
+# --- Experiment sweep -------------------------------------------------------
+seeds: [1, 2, 3, 4, 5]          # replicate "problem instances" (paper used 51/20/10)
+n_test_genomes: 2               # test genomes drawn per seed (paper: 5, 3, or 10)
+
+annotators: ["kmer2node", "minigraph", "graphaligner"]
+solvers:    ["classical_sa", "pathfinder", "gurobi", "mqlib"]
+
+# --- Stage 1: problem creation ----------------------------------------------
+population:
+  n_members: 100                # total simulated population
+  n_generations: 10
+  n_pangenome_build: 40         # subset used to build the pangenome graph
+  genome_length: 20000          # bp, small synthetic "complex region"
+  mutation_rates:
+    point: 0.0008                # per-bp substitution rate per generation
+    str_indel: 0.02              # probability a given STR mutates length
+    cnv: 0.01                    # probability of a CNV duplication/deletion event
+    large_repeat: 0.005          # probability of inserting a large repeat copy
+    translocation: 0.003
+    inversion: 0.003
+  root_mutation_multiplier: 5    # founder genome gets more structural variation
+
+sequencing:
+  coverage: 30
+  read_length: 150
+  substitution_error_rate: 0.01
+  paired: false                  # paper uses single-ended reads for simplicity
+
+# --- Stage 4: QUBO / tangle resolution formulation --------------------------
+qubo:
+  alpha: 1.2                     # T = alpha * sum(w(v))  (walk length budget)
+  lambda1: 10                    # Lagrange multiplier: one node visited per time step
+  lambda2: 5                     # Lagrange multiplier: valid edge traversal
+  problem_variant: "oriented"    # "simple" | "oriented" | "diploid"
+
+solver_params:
+  classical_sa:
+    n_sweeps: 20000
+    n_restarts: 5
+    seed_offset: 0
+  gurobi:
+    time_limit_s: [5, 300]
+  mqlib:
+    time_limit_s: [5, 300]
+  pathfinder:
+    binary: "pathfinder"          # expects Oatk's pathfinder on PATH
+  dwave:
+    time_limit_s: [30, 60]
+
+# --- Stage 5: evaluation -----------------------------------------------------
+evaluation:
+  break_min_gap: 30              # bp gap that triggers a "break" between alignment blocks
+  indel_min_len: 10              # bp, matches paper's >=10bp indel threshold
+  diff_window: 100
+  diff_window_variance: 0.30
+
+paths:
+  results_dir: "results"
+  logs_dir: "logs"

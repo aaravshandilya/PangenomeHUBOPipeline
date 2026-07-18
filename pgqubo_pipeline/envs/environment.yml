@@ -1,0 +1,25 @@
+name: pgqubo
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - snakemake-minimal>=8
+  - numpy
+  - scipy
+  - networkx
+  - pandas
+  - matplotlib
+  - biopython
+  - pip
+  - pip:
+      - dimod        # QUBO container format + samplers (SimulatedAnnealingSampler)
+      - dwave-neal    # fast classical SA sampler, same API as D-Wave's
+      # Optional, only needed if you want the exact solvers/aligners from the paper.
+      # These are NOT on PyPI/conda and must be installed separately:
+      #   - gurobipy + a Gurobi license            -> pip install gurobipy
+      #   - MQLib (https://github.com/MQLib/MQLib) -> build from source, put mqlib on PATH
+      #   - Oatk / pathfinder (https://github.com/c-zhou/oatk) -> build from source
+      #   - minigraph (https://github.com/lh3/minigraph)       -> conda install bioconda::minigraph
+      #   - GraphAligner (https://github.com/maickrau/GraphAligner) -> conda install bioconda::graphaligner
+      #   - dwave-ocean-sdk, with D-Wave Leap API token, for real QA hardware/hybrid solver

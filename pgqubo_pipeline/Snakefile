@@ -1,0 +1,271 @@
+"""
+Pangenome-guided sequence assembly via binary optimization
+Snakemake reimplementation of Cudby et al. 2026 (Briefings in Bioinformatics, bbag084)
+
+Stages:
+  1. Problem creation      -> generate_population.py, build_pangenome.py, shred_genome.py
+  2. Read mapping          -> map_reads.py            (kmer2node / minigraph / GraphAligner)
+  3. Copy number estimation-> estimate_copy_number.py (pathfinder or fallback)
+  4. Path finding           -> build_qubo.py + solve_qubo.py (classical_sa / gurobi / mqlib / pathfinder / dwave)
+  5. Solution processing    -> extract_path.py, refine_consensus.py, evaluate_assembly.py
+
+Run:
+    snakemake -j 8 --configfile config.yaml
+    snakemake -j 8 --use-conda            # to build envs/environment.yml automatically
+"""
+import itertools
+
+configfile: "config.yaml"
+
+SEEDS = config["seeds"]
+ANNOTATORS = config["annotators"]
+SOLVERS = config["solvers"]
+N_TEST = config["n_test_genomes"]
+RESULTS = config["paths"]["results_dir"]
+
+TEST_IDX = list(range(N_TEST))
+
+
+def solver_time_limits(solver):
+    """Solvers with a time-limit sweep (gurobi/mqlib/dwave) expand into
+    multiple instances; others (classical_sa, pathfinder) run once."""
+    sp = config["solver_params"].get(solver, {})
+    return sp.get("time_limit_s", [None])
+
+
+# Build the full list of (seed, annotator, solver, time_limit, test_idx) combos
+INSTANCES = []
+for seed, annot, solver, ti in itertools.product(SEEDS, ANNOTATORS, SOLVERS, TEST_IDX):
+    for tl in solver_time_limits(solver):
+        INSTANCES.append(dict(seed=seed, annotator=annot, solver=solver,
+                               time_limit=tl if tl is not None else 5.0,
+                               test_idx=ti))
+
+
+def instance_dir(inst):
+    return (f"{RESULTS}/seed_{inst['seed']}/annot_{inst['annotator']}/"
+            f"solver_{inst['solver']}_tl{inst['time_limit']}/test_{inst['test_idx']}")
+
+
+rule all:
+    input:
+        f"{RESULTS}/summary_by_annotator_solver.csv",
+        f"{RESULTS}/summary.png",
+        expand(f"{RESULTS}/seed_{{seed}}/candidate_opt_test_{{ti}}.fasta",
+               seed=SEEDS, ti=TEST_IDX)
+
+
+# -----------------------------------------------------------------------
+# Stage 1: problem creation (once per seed -- shared across annotators/solvers)
+# -----------------------------------------------------------------------
+rule generate_population:
+    input:
+        config="config.yaml"
+    output:
+        pangenome_fa=f"{RESULTS}/seed_{{seed}}/population/pangenome_build_genomes.fasta",
+        test_fa=f"{RESULTS}/seed_{{seed}}/population/test_genomes.fasta",
+        meta=f"{RESULTS}/seed_{{seed}}/population/population_meta.json"
+    log: f"{config['paths']['logs_dir']}/seed_{{seed}}/generate_population.log"
+    shell:
+        "python scripts/generate_population.py --config {input.config} "
+        "--seed {wildcards.seed} --out-dir {RESULTS}/seed_{wildcards.seed}/population "
+        "&> {log}"
+
+
+rule build_pangenome:
+    input:
+        fasta=f"{RESULTS}/seed_{{seed}}/population/pangenome_build_genomes.fasta"
+    output:
+        gfa=f"{RESULTS}/seed_{{seed}}/pangenome.gfa"
+    log: f"{config['paths']['logs_dir']}/seed_{{seed}}/build_pangenome.log"
+    shell:
+        "python scripts/build_pangenome.py --fasta {input.fasta} --out {output.gfa} &> {log}"
+
+
+checkpoint split_test_genomes:
+    """Split test_genomes.fasta into one FASTA per held-out individual so
+    each can be shredded/mapped/assembled independently."""
+    input:
+        fasta=f"{RESULTS}/seed_{{seed}}/population/test_genomes.fasta"
+    output:
+        directory(f"{RESULTS}/seed_{{seed}}/test_individuals")
+    run:
+        import os
+        os.makedirs(output[0], exist_ok=True)
+        records = []
+        name, seq = None, []
+        for line in open(input.fasta):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if name is not None:
+                    records.append((name, "".join(seq)))
+                name, seq = line[1:], []
+            else:
+                seq.append(line)
+        if name is not None:
+            records.append((name, "".join(seq)))
+        for i, (name, seq) in enumerate(records):
+            with open(f"{output[0]}/test_{i}.fasta", "w") as fh:
+                fh.write(f">{name}\n{seq}\n")
+
+
+rule shred_genome:
+    input:
+        fasta=f"{RESULTS}/seed_{{seed}}/test_individuals/test_{{ti}}.fasta",
+        config="config.yaml"
+    output:
+        fastq=f"{RESULTS}/seed_{{seed}}/reads/test_{{ti}}.fastq"
+    log: f"{config['paths']['logs_dir']}/seed_{{seed}}/shred_test_{{ti}}.log"
+    shell:
+        "python scripts/shred_genome.py --fasta {input.fasta} --config {input.config} "
+        "--seed {wildcards.seed} --out-dir {RESULTS}/seed_{wildcards.seed}/reads &> {log} && "
+        "mv {RESULTS}/seed_{wildcards.seed}/reads/*.fastq {output.fastq} 2>/dev/null || true"
+
+
+# -----------------------------------------------------------------------
+# Stage 2: read mapping (per annotator)
+# -----------------------------------------------------------------------
+rule map_reads:
+    input:
+        gfa=f"{RESULTS}/seed_{{seed}}/pangenome.gfa",
+        fastq=f"{RESULTS}/seed_{{seed}}/reads/test_{{ti}}.fastq"
+    output:
+        nodes=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/annotated.nodes.tsv",
+        edges=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/annotated.edges.tsv"
+    log: f"{config['paths']['logs_dir']}/seed_{{seed}}/map_reads_{{annotator}}_test_{{ti}}.log"
+    shell:
+        "python scripts/map_reads.py --gfa {input.gfa} --fastq {input.fastq} "
+        "--annotator {wildcards.annotator} "
+        "--out-prefix {RESULTS}/seed_{wildcards.seed}/annot_{wildcards.annotator}/test_{wildcards.ti}/annotated "
+        "&> {log}"
+
+
+# -----------------------------------------------------------------------
+# Stage 3: copy number estimation
+# -----------------------------------------------------------------------
+rule estimate_copy_number:
+    input:
+        nodes=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/annotated.nodes.tsv",
+        config="config.yaml"
+    output:
+        cn=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/copy_numbers.tsv"
+    log: f"{config['paths']['logs_dir']}/seed_{{seed}}/cn_{{annotator}}_test_{{ti}}.log"
+    shell:
+        "python scripts/estimate_copy_number.py --nodes {input.nodes} --config {input.config} "
+        "--out {output.cn} &> {log}"
+
+
+# -----------------------------------------------------------------------
+# Stage 4: path finding (QUBO construction + solve)
+# -----------------------------------------------------------------------
+rule build_qubo:
+    input:
+        gfa=f"{RESULTS}/seed_{{seed}}/pangenome.gfa",
+        cn=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/copy_numbers.tsv",
+        config="config.yaml"
+    output:
+        qubo=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/qubo/instance.qubo.tsv",
+        meta=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/qubo/instance.meta.json"
+    log: f"{config['paths']['logs_dir']}/seed_{{seed}}/build_qubo_{{annotator}}_test_{{ti}}.log"
+    shell:
+        "python scripts/build_qubo.py --gfa {input.gfa} --copy-numbers {input.cn} "
+        "--config {input.config} "
+        "--out-prefix {RESULTS}/seed_{wildcards.seed}/annot_{wildcards.annotator}/test_{wildcards.ti}/qubo/instance "
+        "&> {log}"
+
+
+rule solve_qubo:
+    input:
+        qubo=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/qubo/instance.qubo.tsv",
+        meta=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/qubo/instance.meta.json",
+        config="config.yaml"
+    output:
+        assignment=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/solver_{{solver}}_tl{{tl}}/assignment.tsv"
+    log: f"{config['paths']['logs_dir']}/seed_{{seed}}/solve_{{annotator}}_{{solver}}_tl{{tl}}_test_{{ti}}.log"
+    shell:
+        "python scripts/solve_qubo.py "
+        "--qubo-prefix {RESULTS}/seed_{wildcards.seed}/annot_{wildcards.annotator}/test_{wildcards.ti}/qubo/instance "
+        "--config {input.config} --solver {wildcards.solver} --time-limit {wildcards.tl} "
+        "--seed {wildcards.seed} --out {output.assignment} &> {log}"
+
+
+# -----------------------------------------------------------------------
+# Stage 5: solution processing
+# -----------------------------------------------------------------------
+rule extract_path:
+    input:
+        assignment=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/solver_{{solver}}_tl{{tl}}/assignment.tsv",
+        gfa=f"{RESULTS}/seed_{{seed}}/pangenome.gfa",
+        meta=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/qubo/instance.meta.json"
+    output:
+        candidate=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/solver_{{solver}}_tl{{tl}}/candidate.fasta"
+    log: f"{config['paths']['logs_dir']}/seed_{{seed}}/extract_{{annotator}}_{{solver}}_tl{{tl}}_test_{{ti}}.log"
+    shell:
+        "python scripts/extract_path.py --assignment {input.assignment} --gfa {input.gfa} "
+        "--meta {input.meta} --out {output.candidate} &> {log}"
+
+
+rule refine_consensus:
+    input:
+        candidate=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/solver_{{solver}}_tl{{tl}}/candidate.fasta",
+        fastq=f"{RESULTS}/seed_{{seed}}/reads/test_{{ti}}.fastq"
+    output:
+        candidate_opt=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/solver_{{solver}}_tl{{tl}}/candidate_opt.fasta"
+    log: f"{config['paths']['logs_dir']}/seed_{{seed}}/refine_{{annotator}}_{{solver}}_tl{{tl}}_test_{{ti}}.log"
+    shell:
+        "python scripts/refine_consensus.py --candidate {input.candidate} --fastq {input.fastq} "
+        "--out {output.candidate_opt} &> {log}"
+
+
+rule evaluate_assembly:
+    input:
+        candidate=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/solver_{{solver}}_tl{{tl}}/candidate_opt.fasta",
+        truth=f"{RESULTS}/seed_{{seed}}/test_individuals/test_{{ti}}.fasta",
+        config="config.yaml"
+    output:
+        metrics=f"{RESULTS}/seed_{{seed}}/annot_{{annotator}}/test_{{ti}}/solver_{{solver}}_tl{{tl}}/metrics.json"
+    log: f"{config['paths']['logs_dir']}/seed_{{seed}}/eval_{{annotator}}_{{solver}}_tl{{tl}}_test_{{ti}}.log"
+    params:
+        tag=lambda wc: f"seed={wc.seed};annotator={wc.annotator};solver={wc.solver};"
+                       f"time_limit={wc.tl};test_idx={wc.ti}"
+    shell:
+        "python scripts/evaluate_assembly.py --candidate {input.candidate} --truth {input.truth} "
+        "--config {input.config} --tag '{params.tag}' --out {output.metrics} &> {log}"
+
+
+# Convenience copy of the best-effort refined candidate per seed/test (first
+# annotator+solver combo) so `rule all` has a simple top-level artifact too.
+rule collect_example_candidate:
+    input:
+        lambda wc: f"{RESULTS}/seed_{wc.seed}/annot_{ANNOTATORS[0]}/test_{wc.ti}/"
+                   f"solver_{SOLVERS[0]}_tl{solver_time_limits(SOLVERS[0])[0] or 5.0}/candidate_opt.fasta"
+    output:
+        f"{RESULTS}/seed_{{seed}}/candidate_opt_test_{{ti}}.fasta"
+    shell:
+        "cp {input} {output}"
+
+
+# -----------------------------------------------------------------------
+# Final aggregation across every seed x annotator x solver instance
+# -----------------------------------------------------------------------
+def all_metrics_files(wildcards):
+    files = []
+    for inst in INSTANCES:
+        files.append(
+            f"{RESULTS}/seed_{inst['seed']}/annot_{inst['annotator']}/"
+            f"test_{inst['test_idx']}/solver_{inst['solver']}_tl{inst['time_limit']}/metrics.json"
+        )
+    return files
+
+
+rule aggregate_results:
+    input:
+        all_metrics_files
+    output:
+        csv=f"{RESULTS}/summary_by_annotator_solver.csv",
+        png=f"{RESULTS}/summary.png"
+    shell:
+        "python scripts/aggregate_results.py "
+        "--metrics-glob '{RESULTS}/**/metrics.json' --out-dir {RESULTS}"
