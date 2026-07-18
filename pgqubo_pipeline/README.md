@@ -1,7 +1,7 @@
 # Pangenome-Guided Sequence Assembly — Snakemake Pipeline
 
 A Snakemake reimplementation of the 5-stage workflow from
-**Cudby et al., "Pangenome-guided sequence assembly via binary optimization,"
+**Strelchuk et al., "Pangenome-guided sequence assembly via binary optimization,"
 Briefings in Bioinformatics 2026 (bbag084)**.
 
 ```
