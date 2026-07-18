@@ -1,6 +1,6 @@
 """
 Pangenome-guided sequence assembly via binary optimization
-Snakemake reimplementation of Cudby et al. 2026 (Briefings in Bioinformatics, bbag084)
+Snakemake reimplementation of Strelchuk et al. 2026 (Briefings in Bioinformatics, bbag084)
 
 Stages:
   1. Problem creation      -> generate_population.py, build_pangenome.py, shred_genome.py
